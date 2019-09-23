@@ -47,6 +47,7 @@ import org.apache.gobblin.data.management.copy.CopyEntity;
 import org.apache.gobblin.data.management.copy.CopySource;
 import org.apache.gobblin.data.management.copy.writer.FileAwareInputStreamDataWriter;
 import org.apache.gobblin.data.management.copy.writer.FileAwareInputStreamDataWriterBuilder;
+import org.apache.gobblin.runtime.mapreduce.GobblinWorkUnitsInputFormat;
 import org.apache.gobblin.source.workunit.WorkUnit;
 import org.apache.gobblin.util.guid.Guid;
 
@@ -61,6 +62,8 @@ public class DistcpFileSplitter {
 
   public static final String SPLIT_ENABLED = CopyConfiguration.COPY_PREFIX + ".split.enabled";
   public static final String MAX_SPLIT_SIZE_KEY = CopyConfiguration.COPY_PREFIX + ".file.max.split.size";
+
+  private static final double SPLIT_SLOP = 0.1;
 
   public static final long DEFAULT_MAX_SPLIT_SIZE = Long.MAX_VALUE;
   public static final Set<String> KNOWN_SCHEMES_SUPPORTING_CONCAT = Sets.newHashSet("hdfs", "adl");
@@ -93,8 +96,8 @@ public class DistcpFileSplitter {
    * @return a list of {@link WorkUnit}, each for a split of this file.
    * @throws IOException
    */
-  public static Collection<WorkUnit> splitFile(CopyableFile file, WorkUnit workUnit, FileSystem targetFs)
-      throws IOException {
+  public static Collection<WorkUnit> splitFile(CopyableFile file, WorkUnit workUnit, FileSystem targetFs,
+      long minWorkUnitWeight) throws IOException {
     long len = file.getFileStatus().getLen();
     // get lcm of source and target block size so that split aligns with block boundaries for both extract and write
     long blockSize = ArithmeticUtils.lcm(file.getFileStatus().getBlockSize(), file.getBlockSize(targetFs));
@@ -112,18 +115,25 @@ public class DistcpFileSplitter {
 
     long lengthPerSplit = (maxSplitSize / blockSize) * blockSize;
     int splits = (int) (len / lengthPerSplit + 1);
+    if (splits > 1 && ((double) (len % lengthPerSplit)) / lengthPerSplit < SPLIT_SLOP) {
+      splits -= 1;
+    }
 
     for (int i = 0; i < splits; i++) {
       WorkUnit newWorkUnit = WorkUnit.copyOf(workUnit);
 
       long lowPos = lengthPerSplit * i;
-      long highPos = Math.min(lengthPerSplit * (i + 1), len);
+      long highPos = (i == splits - 1) ? len : lengthPerSplit * (i + 1);
 
       Split split = new Split(lowPos, highPos, i, splits,
           String.format("%s.__PART%d__", file.getDestination().getName(), i));
       String serializedSplit = GSON.toJson(split);
 
       newWorkUnit.setProp(SPLIT_KEY, serializedSplit);
+      newWorkUnit.setProp(GobblinWorkUnitsInputFormat.GOBBLIN_SPLIT_FILE_PATH, file.getOrigin().getPath());
+      newWorkUnit.setProp(GobblinWorkUnitsInputFormat.GOBBLIN_SPLIT_FILE_LOW_POSITION, lowPos);
+      newWorkUnit.setProp(GobblinWorkUnitsInputFormat.GOBBLIN_SPLIT_FILE_HIGH_POSITION, highPos);
+      newWorkUnit.setProp(GobblinWorkUnitsInputFormat.WORK_UNIT_WEIGHT, Math.max(highPos - lowPos, minWorkUnitWeight));
 
       Guid oldGuid = CopySource.getWorkUnitGuid(newWorkUnit).get();
       Guid newGuid = oldGuid.append(Guid.fromStrings(serializedSplit));

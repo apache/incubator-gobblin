@@ -75,6 +75,8 @@ import org.apache.gobblin.metrics.Tag;
 import org.apache.gobblin.metrics.event.EventSubmitter;
 import org.apache.gobblin.metrics.event.lineage.LineageInfo;
 import org.apache.gobblin.metrics.event.sla.SlaEventKeys;
+import org.apache.gobblin.runtime.mapreduce.GobblinWorkUnitsInputFormat;
+import org.apache.gobblin.runtime.mapreduce.MRJobLauncher;
 import org.apache.gobblin.source.extractor.Extractor;
 import org.apache.gobblin.source.extractor.WatermarkInterval;
 import org.apache.gobblin.source.extractor.extract.AbstractSource;
@@ -130,8 +132,7 @@ public class CopySource extends AbstractSource<String, FileAwareInputStream> {
   public static final String FILESET_TOTAL_ENTITIES = "fileset.total.entities";
   public static final String FILESET_TOTAL_SIZE_IN_BYTES = "fileset.total.size";
 
-  private static final String WORK_UNIT_WEIGHT = CopyConfiguration.COPY_PREFIX + ".workUnitWeight";
-  private final WorkUnitWeighter weighter = new FieldWeighter(WORK_UNIT_WEIGHT);
+  private final WorkUnitWeighter weighter = new FieldWeighter(GobblinWorkUnitsInputFormat.WORK_UNIT_WEIGHT);
 
   public MetricContext metricContext;
   public EventSubmitter eventSubmitter;
@@ -264,13 +265,18 @@ public class CopySource extends AbstractSource<String, FileAwareInputStream> {
         return Lists.newArrayList();
       }
 
-      List<? extends WorkUnit> workUnits = new WorstFitDecreasingBinPacking(maxSizePerBin)
-          .pack(Lists.newArrayList(workUnitsMap.values()), this.weighter);
-      log.info(String.format(
-          "Bin packed work units. Initial work units: %d, packed work units: %d, max weight per bin: %d, "
-              + "max work units per bin: %d.", workUnitsMap.size(), workUnits.size(), maxSizePerBin,
-          maxWorkUnitsPerMultiWorkUnit));
-      return ImmutableList.copyOf(workUnits);
+      if (state.contains(MRJobLauncher.INPUT_FORMAT_CLASS_KEY) &&
+          !state.getProp(MRJobLauncher.INPUT_FORMAT_CLASS_KEY).equals(MRJobLauncher.DEFAULT_INPUT_FORMAT_CLASS)) {
+        return ImmutableList.copyOf(workUnitsMap.values());
+      } else {
+        List<? extends WorkUnit> workUnits = new WorstFitDecreasingBinPacking(maxSizePerBin)
+            .pack(Lists.newArrayList(workUnitsMap.values()), this.weighter);
+        log.info(String.format(
+            "Bin packed work units. Initial work units: %d, packed work units: %d, max weight per bin: %d, "
+                + "max work units per bin: %d.", workUnitsMap.size(), workUnits.size(), maxSizePerBin,
+            maxWorkUnitsPerMultiWorkUnit));
+        return ImmutableList.copyOf(workUnits);
+      }
     } catch (IOException e) {
       throw new RuntimeException(e);
     }
@@ -368,13 +374,15 @@ public class CopySource extends AbstractSource<String, FileAwareInputStream> {
           workUnit.setProp(ConfigurationKeys.DATASET_URN_KEY, datasetAndPartition.toString());
           workUnit.setProp(SlaEventKeys.DATASET_URN_KEY, this.copyableDataset.datasetURN());
           workUnit.setProp(SlaEventKeys.PARTITION_KEY, copyEntity.getFileSet());
-          setWorkUnitWeight(workUnit, copyEntity, minWorkUnitWeight);
           setWorkUnitWatermark(workUnit, watermarkGenerator, copyEntity);
           computeAndSetWorkUnitGuid(workUnit);
           addLineageInfo(copyEntity, workUnit);
-          if (copyEntity instanceof CopyableFile && DistcpFileSplitter.allowSplit(this.state, this.targetFs)) {
-            workUnitsForPartition.addAll(DistcpFileSplitter.splitFile((CopyableFile) copyEntity, workUnit, this.targetFs));
+          if (copyEntity instanceof CopyableFile && ((CopyableFile) copyEntity).getOrigin().getLen() > 0 &&
+              DistcpFileSplitter.allowSplit(this.state, this.targetFs)) {
+            workUnitsForPartition.addAll(DistcpFileSplitter.splitFile((CopyableFile) copyEntity,
+                workUnit, this.targetFs, minWorkUnitWeight));
           } else {
+            setWorkUnitWeight(workUnit, copyEntity, minWorkUnitWeight);
             workUnitsForPartition.add(workUnit);
           }
         }
@@ -472,7 +480,7 @@ public class CopySource extends AbstractSource<String, FileAwareInputStream> {
       weight = ((CopyableFile) copyEntity).getOrigin().getLen();
     }
     weight = Math.max(weight, minWeight);
-    workUnit.setProp(WORK_UNIT_WEIGHT, Long.toString(weight));
+    workUnit.setProp(GobblinWorkUnitsInputFormat.WORK_UNIT_WEIGHT, Long.toString(weight));
   }
 
   private static void computeAndSetWorkUnitGuid(WorkUnit workUnit)
