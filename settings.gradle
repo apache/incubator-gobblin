@@ -86,3 +86,5 @@ if (file('gobblin-restli').exists()) {
     }
   }
 }
+include 'gobblin-iceberg'
+
